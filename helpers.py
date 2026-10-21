@@ -403,6 +403,16 @@ def range_to_bbox(rng: list[float]) -> list[float]:
     return [rng[0], rng[1], rng[2] - rng[0], rng[3] - rng[1]]
 
 
+def keys_related(a: str, b: str) -> bool:
+    """Two different vendor keys that are probably spellings of one vendor: one's words start the other's
+    ('konoike pacific california' / 'konoike pacific california dba kpac'), or they share at least half their words."""
+    ta, tb = a.split(), b.split()
+    if not ta or not tb or a == b:
+        return False
+    short, longer = sorted((ta, tb), key=len)
+    return longer[:len(short)] == short or len(set(ta) & set(tb)) / len(set(ta) | set(tb)) >= 0.5
+
+
 def normalize_log(log_scores: dict[str, float]) -> dict[str, float]:
     """Unnormalized log scores -> probabilities that sum to 1 (log-sum-exp, so tiny likelihoods don't underflow)."""
     top = max(log_scores.values())
@@ -532,8 +542,8 @@ GATED_SUFFIX = """
 MEMORY GUIDE WITH CONFIDENCES
 The rules below come from a memory of earlier invoices. Each carries a probability, computed from how well this
 PDF matches the remembered layout and how consistently the value sat in the same region on earlier invoices:
-- "search region box_2d [...] (confidence p)": the value is printed inside that region with probability p. Look
-  there first, but return the box of the value as printed, not the region.
+- "value usually at box_2d [...] (confidence p)": with probability p the value is printed at about that
+  position on this PDF. Use it to find fields you would otherwise miss and to place boxes precisely.
 - "position uncertain": the remembered position is not trustworthy for this PDF; only the label hint is given.
 - "expected with probability p": how likely it is that the field is printed on this page at all.
 Rules that are too unlikely to apply are left out. Never copy a value from the memory; always read it from this
