@@ -1,0 +1,7 @@
+neo4j>=5.26
+google-genai>=1.0
+pymupdf>=1.25
+pandas>=2.2
+numpy>=2.0
+tenacity>=8.5
+jupyterlab>=4.0
