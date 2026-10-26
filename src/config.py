@@ -49,9 +49,6 @@ class Config:
     gate_box: float = 0.7                       # confidence at or above which a rule's typical box is shown
     gate_label: float = 0.4                     # ...at or above which only its label is shown; below, withheld
 
-    # --- Ungated guide -------------------------------------------------------------------------------------------
-    guide_neighbours: int = 2                   # similar layouts offered by the ungated guide for an unknown vendor
-
     # --- Generated test pages (the stand-in for Gemini's unguided call) ------------------------------------------
     scenario_seed: int = 11
     noise_box_miss: float = 0.057               # mean distance a simulated box centre lands from the true one

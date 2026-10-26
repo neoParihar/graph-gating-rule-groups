@@ -1,4 +1,4 @@
-"""The vendor-rooted memory graph in Neo4j: build (ingest + consolidate), read back, and the ungated (pass-1) guide.
+"""The vendor-rooted memory graph in Neo4j: build (ingest + consolidate), and read back.
 The Cypher is gating.ipynb's, unchanged.
 
 (:DocumentType)<-[:OF_TYPE]-(:Vendor)-[:HAS_LAYOUT]->(:PageLayout)-[:HAS_SECTION]->(:SectionLayout)
@@ -195,13 +195,6 @@ MATCH (p:PageLayout)-[:HAS_TABLE]->(t:TableLayout)
 RETURN p.id AS layout_id, t.type AS key, size(t.obs_doc_ids) AS n_filled
 """
 
-NEAREST_LAYOUTS = """
-MATCH (v:Vendor)-[:HAS_LAYOUT]->(p:PageLayout {page_number: $page})
-WHERE v.key <> $all AND ($vendor IS NULL OR v.key = $vendor)
-RETURN p.id AS layout_id, v.key AS vendor, p.doc_count AS docs,
-       vector.similarity.cosine(p.structure_vector, $structure) AS structure_similarity
-ORDER BY structure_similarity DESC, docs DESC LIMIT $k
-"""
 
 
 def assign_variants(records: dict, doc_ids: set[str], threshold: float) -> dict[tuple[str, int], int]:
@@ -412,7 +405,8 @@ class MemoryGraph:
     def entity_observations(self, layout_id: str, key: str) -> dict:
         """The raw observations and consolidated rule of one EntityLayout."""
         return self.cypher("""MATCH (e:EntityLayout {id: $id})
-                              RETURN e.obs_doc_ids AS doc_ids, e.obs_x AS x, e.obs_y AS y, e.obs_w AS w, e.obs_h AS h,
+                              RETURN e.obs_doc_ids AS doc_ids, e.obs_filled AS filled, e.obs_labels AS labels,
+                                     e.obs_x AS x, e.obs_y AS y, e.obs_w AS w, e.obs_h AS h,
                                      e.bbox_center AS center, e.bbox_median AS median, e.bbox_range AS range,
                                      e.support AS support, e.n_boxes AS n_boxes, e.n_in_range AS n_in_range,
                                      e.p_in_range AS q, e.strength AS strength""", id=f"{layout_id}|{key}")[0]
@@ -441,53 +435,3 @@ class MemoryGraph:
             rules["bbox"] = rules["bbox"].map(lambda b: b if isinstance(b, list) else None)
             rules["top_labels"] = rules["top_labels"].map(lambda l: l if isinstance(l, list) else [])
         return rules
-
-    # --- The ungated (pass-1) guide ---------------------------------------------------------------------------
-
-    def nearest_layouts(self, structure: list[float], page_number: int, vendor: str | None = None,
-                        k: int = 5) -> list[dict]:
-        """The k vendor PageLayouts with the highest structure-vector cosine (of one vendor, or of any)."""
-        return self.cypher(NEAREST_LAYOUTS, page=min(page_number, 2), vendor=vendor, all=ALL_VENDORS,
-                           structure=structure, k=k)
-
-    def memory_guide(self, vendor_name: str, page: dict) -> dict:
-        """The paths that guide one page in the ungated pass: the vendor's closest layout if the vendor is known,
-        otherwise the guide_neighbours closest layouts of any vendor; always the ALL_VENDORS layout."""
-        vkey = H.vendor_key(vendor_name)
-        structure = H.structure_vector(page, self.cfg.position_grid, self.cfg.position_weight)
-        own = self.nearest_layouts(structure, page["number"], vendor=vkey, k=1)
-        if own:
-            chosen = [{**own[0], "source": "same vendor"}]
-        else:
-            chosen = [{**n, "source": "similar structure, other vendor"}
-                      for n in self.nearest_layouts(structure, page["number"], k=self.cfg.guide_neighbours)]
-        chosen.append({"layout_id": f"{ALL_VENDORS}|p{min(page['number'], 2)}|v0", "vendor": ALL_VENDORS,
-                       "source": "corpus labels", "structure_similarity": None})
-        return {"vendor_key": vkey, "vendor_known": bool(own), "page": page["number"], "layouts": chosen}
-
-    def rules_to_text(self, guide: dict) -> str:
-        """Render an ungated guide as prompt text: one line per entity rule (box + label), one per table."""
-        lines = [f"PAGE {guide['page']}"]
-        for layout in guide["layouts"]:
-            rules = self.layout_rules(layout["layout_id"])
-            if rules.empty:
-                continue
-            sim = layout.get("structure_similarity")
-            lines.append(f"  Layout (vendor tree '{layout['vendor']}', {layout['source']}"
-                         + (f", structure similarity {sim:.2f}" if sim is not None else "")
-                         + f", built from {rules.layout_docs.iloc[0]} invoice(s)):")
-            corpus = layout["vendor"] == ALL_VENDORS
-            for r in rules.itertuples():
-                labels = f" labelled {', '.join(repr(l) for l in r.top_labels)}" if r.top_labels else ""
-                if r.kind == "table":
-                    where = f" in region box_2d {H.bbox_to_box2d(r.bbox)}" if r.bbox and not corpus else ""
-                    lines.append(f"    TABLE {r.name}: present on {r.fill_rate:.0%} of pages{where}; usually "
-                                 f"filled columns: {', '.join(r.top_labels) or '-'}")
-                elif corpus:
-                    if r.top_labels:
-                        lines.append(f"    {r.name}: common labels {', '.join(repr(l) for l in r.top_labels)}")
-                else:
-                    where = (f"value usually at box_2d {H.bbox_to_box2d(r.bbox)} ({r.strength}: {r.support} of "
-                             f"{r.n_boxes} located)" if r.bbox and r.strength != "none" else "position varies")
-                    lines.append(f"    {r.name}: filled on {r.fill_rate:.0%} of pages; {where}{labels}")
-        return "\n".join(lines)

@@ -15,7 +15,6 @@ import pandas as pd
 import helpers as H
 from src.data import BUCKET_ORDER, NEW, Corpus
 from src.gate import Gate
-from src.memory_graph import MemoryGraph
 from src.posterior import TERM_SETS, LayoutPosterior
 from src.scenarios import Case
 
@@ -48,47 +47,15 @@ def evaluate(gate: Gate, cases: list[Case]) -> tuple[pd.DataFrame, pd.DataFrame]
     return pd.DataFrame(pages), pd.DataFrame(rules)
 
 
-def ungated_shown(graph: MemoryGraph, posterior: LayoutPosterior, case: Case) -> tuple[dict, dict[str, dict]]:
-    """(the ungated guide, entity -> rule it puts in the prompt): every located rule of the nearest layout,
-    whatever its strength, as pass 1 does."""
-    guide = graph.memory_guide(case.vendor_name, case.evidence)
-    shown = {}
-    for layout in guide["layouts"]:
-        for key, r in posterior.vendor_layouts.get(layout["layout_id"], {"rules": {}})["rules"].items():
-            if r["strength"] != "none":
-                shown.setdefault(key, {**r, "layout_id": layout["layout_id"]})
-    return guide, shown
-
-
-def evaluate_ungated(graph: MemoryGraph, posterior: LayoutPosterior, cases: list[Case]) -> pd.DataFrame:
-    """What the ungated (pass-1) guide would put in the prompt for the same pages, one row per shown rule, judged
-    by the same hit criterion as the gate."""
-    rows = []
-    for c in cases:
-        guide, shown = ungated_shown(graph, posterior, c)
-        for key, r in shown.items():
-            f = c.gt["fields"].get(key)
-            if f and f["usable"]:
-                rows.append({"case_id": c.case_id, "study": c.study, "scenario": c.scenario, "entity": key,
-                             "vendor_known": guide["vendor_known"],
-                             "hit": H.in_range(H.bbox_center(f["bbox"]), r["range"])})
-    return pd.DataFrame(rows)
-
-
-def memory_effect(pages: pd.DataFrame, gated: pd.DataFrame, ungated: pd.DataFrame,
-                  by=("study", "scenario")) -> pd.DataFrame:
-    """Per scenario, positions put in front of the model per page: how many, how many right (precision), and how
-    many wrong, for the ungated guide against the gate's "box" rules. Wrong positions are what misleads an LLM."""
+def shown_positions(pages: pd.DataFrame, rules: pd.DataFrame, by=("study", "scenario")) -> pd.DataFrame:
+    """Per scenario, the positions the gate puts in front of the model: boxes per page, how many are right
+    (precision), and wrong boxes per page. Wrong positions are what misleads an LLM."""
     by = list(by)
     n_pages = pages.groupby(by, sort=False).size()
-    shown = gated[gated.gate == "box"]
-    out = pd.DataFrame({"pages": n_pages})
-    for name, df in (("ungated", ungated), ("gated", shown)):
-        g = df.groupby(by, sort=False).hit
-        out[f"{name}_boxes_per_page"] = g.size() / n_pages
-        out[f"{name}_precision"] = g.mean()
-        out[f"{name}_wrong_per_page"] = (g.size() - g.sum()) / n_pages
-    return out.fillna({c: 0.0 for c in out.columns if c.endswith("per_page")}).round(3)
+    hit = rules[rules.gate == "box"].groupby(by, sort=False).hit
+    out = pd.DataFrame({"pages": n_pages, "boxes_per_page": hit.size() / n_pages, "precision": hit.mean(),
+                        "wrong_per_page": (hit.size() - hit.sum()) / n_pages}).reindex(n_pages.index)
+    return out.fillna({"boxes_per_page": 0.0, "wrong_per_page": 0.0}).round(3)
 
 
 def reliability(prob: pd.Series, outcome: pd.Series, bins=(0, 0.2, 0.4, 0.6, 0.8, 0.9, 1.0001)) -> pd.DataFrame:
@@ -165,7 +132,7 @@ def twin_agreement(rules: pd.DataFrame) -> pd.DataFrame:
 
 # --- Part IV: saved Gemini passes (gating.ipynb's evaluation, shortened) ----------------------------------------
 
-LLM_SETUPS = {"unguided": "unguided", "ungated memory (pass 1)": "pass1", "gated memory (pass 2)": "pass2"}
+LLM_SETUPS = {"unguided": "unguided", "gated memory": "pass2"}
 LLM_METRICS = ["value_exact_acc", "false_fill", "mean_bbox_overlap", "center_within_tol"]
 
 

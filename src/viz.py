@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pymupdf
 from matplotlib.patches import Rectangle
-from neo4j_viz import Node, Relationship, VisualizationGraph
+from neo4j_viz import Node
 from neo4j_viz.neo4j import from_neo4j
 
 import helpers as H
@@ -51,41 +51,28 @@ def default_caption(node: Node) -> str:
     label = _label(node)
     value = node.properties.get(CAPTION_PROPERTY.get(label, ""), label)
     if label == "PageLayout":
-        return f"page {node.properties['page_number']} · v{node.properties['variant']} ({node.properties['doc_count']} docs)"
+        return f"page {node.properties['page_number']} v{node.properties['variant']}"
     return str(value)
 
 
 def show_graph(driver, query: str, *, caption: Callable[[Node], str] = default_caption,
                color: Callable[[Node], str] | None = None, size: Callable[[Node], float] | None = None,
-               layout: str = "forcedirected", height: str = "520px", **params):
+               legend: dict[str, str] | None = None, layout: str = "forcedirected", height: str = "520px",
+               **params):
     """Run a Cypher query that returns nodes/relationships/paths and render the subgraph inline.
-    `color`/`size`/`caption` map each node to its style; nodes are colored by label by default."""
+    `color`/`size`/`caption` map each node to its style; nodes are colored by label by default. `legend` is
+    {entry: color} for the graph's own legend overlay (by default, the labels present). Nodes stay at least
+    radius 24, below which neo4j-viz draws no caption."""
     vg = from_neo4j(driver.execute_query(query, **params))
     for n in vg.nodes:
         n.caption = caption(n)
         n.color = color(n) if color else LABEL_COLORS.get(_label(n), MUTED)
-        n.size = size(n) if size else 14 if _label(n) in ("Vendor", "PageLayout") else 9
+        n.size = size(n) if size else 34 if _label(n) in ("Vendor", "PageLayout") else 28
     for r in vg.relationships:
         r.caption = r.properties.get("type")
+    vg.set_legend(nodes=legend or {lab: LABEL_COLORS[lab] for lab in LABEL_COLORS
+                                   if any(_label(n) == lab for n in vg.nodes)})
     return vg.render(layout=layout, height=height)
-
-
-def show_virtual(nodes: list[dict], edges: list[dict], layout: str = "forcedirected", height: str = "460px"):
-    """Render a graph that is not in Neo4j (e.g. a test page and its candidate layouts).
-    nodes: {id, caption, color, size}; edges: {source, target, caption, width?}."""
-    vg = VisualizationGraph(
-        [Node(id=n["id"], caption=n["caption"], color=n.get("color", MUTED), size=n.get("size", 12)) for n in nodes],
-        [Relationship(source=e["source"], target=e["target"], caption=e.get("caption"),
-                      width=e.get("width", 1)) for e in edges])
-    return vg.render(layout=layout, height=height)
-
-
-def legend_html(colors: dict[str, str]) -> str:
-    """A small HTML legend to print above a neo4j-viz graph (identity is never color alone)."""
-    items = "".join(f'<span style="margin-right:14px;white-space:nowrap"><span style="display:inline-block;'
-                    f'width:10px;height:10px;border-radius:50%;background:{c};margin-right:5px"></span>{k}</span>'
-                    for k, c in colors.items())
-    return f'<div style="font:12px system-ui,sans-serif;color:{INK_2};margin:4px 0 6px">{items}</div>'
 
 
 # --- Pages ---------------------------------------------------------------------------------------------------
