@@ -139,22 +139,34 @@ def page_with_fields(pdf_path: Path, page: dict, ax=None, title: str | None = No
 # --- Charts --------------------------------------------------------------------------------------------------
 
 
-def term_bars(explain: pd.DataFrame, ax=None, title: str = "What moves the belief: log-terms per candidate"):
-    """Grouped horizontal bars: each Bayes term's log contribution for the top candidates (relative to the best
-    candidate, so 0 = as good as the winner on that term)."""
-    terms = ["prior", "name", "fields", "boxes"]
+TERM_NAMES = {"prior": "how common it is (prior)", "name": "vendor name", "fields": "which fields are present",
+              "boxes": "where the boxes are"}
+
+
+def term_bars(explain: pd.DataFrame, ax=None, title: str = "Which evidence rules each candidate out"):
+    """Grouped horizontal bars: for the top candidates, how far each piece of evidence (each Bayes term) puts the
+    candidate behind the best candidate on that evidence, in log units. Bars grow leftward from 0 (as good as the
+    best), so the candidate axis sits on the right, at 0."""
+    terms = list(TERM_NAMES)
     rel = explain[terms] - explain[terms].max()
-    labels = [f"{i if i == 'NEW' else explain.at[i, 'vendor']} · P={explain.at[i, 'posterior']:.2f}"
-              for i in explain.index]
+    def short(name: str, n: int = 26) -> str:
+        return name if len(name) <= n else name[:n - 1] + "…"
+
+    labels = [("NEW (unlike any in memory)" if i == "NEW" else
+               f"{short(explain.at[i, 'vendor'])} ({' '.join(i.split('|')[-2:])})") +
+              f"\nprobability {explain.at[i, 'posterior']:.2f}" for i in explain.index]
     if ax is None:
         _, ax = plt.subplots(figsize=(8, 0.55 * len(explain) + 1.2))
     y = np.arange(len(explain))
     h = 0.8 / len(terms)
     for j, (term, color) in enumerate(zip(terms, (MUTED, BLUE, ORANGE, AQUA))):
-        ax.barh(y + (j - 1.5) * h, rel[term].clip(lower=-40), height=h * 0.92, color=color, label=term)
+        ax.barh(y + (j - 1.5) * h, rel[term].clip(lower=-40), height=h * 0.92, color=color, label=TERM_NAMES[term])
     ax.set_yticks(y, labels), ax.invert_yaxis()
-    ax.axvline(0, color=AXIS, lw=1)
-    ax.set_xlabel("log-score minus the best candidate's (clipped at −40)")
+    ax.yaxis.tick_right(), ax.yaxis.set_label_position("right")
+    ax.spines["right"].set_visible(True), ax.spines["left"].set_visible(False)
+    ax.set_xlim(max(float(rel.clip(lower=-40).min().min()), -40) * 1.05 - 0.2, 0)
+    ax.set_ylabel("candidate and its final probability")
+    ax.set_xlabel("how much less likely than the best candidate (log scale: −2.3 = 10× less likely)")
     ax.legend(ncol=4, loc="lower left", bbox_to_anchor=(0, 1.0))
     ax.set_title(title, loc="left", pad=22)
     return ax
