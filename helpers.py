@@ -9,7 +9,7 @@ layouts, both guide tools and scoring.
 ###!FUTURE DATA REQUIREMENTS!###
 
 The ground-truth JSON does not carry the items below, so this notebook reads them from the input PDFs (only in
-helpers.pdf_page_facts). Future ground-truth OCR outputs should include them, so the memory can be built from the
+helpers.read_pdf_page_facts). Future ground-truth OCR outputs should include them, so the memory can be built from the
 JSON alone.
 
 1. Page dimensions and units
@@ -124,7 +124,7 @@ DESCRIPTIONS: dict[str, str] = {
 # Data the ground-truth JSON does not carry, so it is read from the PDF for now
 # ---------------------------------------------------------------------------
 
-def pdf_page_facts(pdf_path: Path) -> dict[int, dict[str, Any]]:
+def read_pdf_page_facts(pdf_path: Path) -> dict[int, dict[str, Any]]:
     """The only place an input PDF is read: per page number, its size (points), whether it has a text layer, and
     its words (x0, y0, x1, y1, text) for label lookup. See FUTURE_DATA_REQUIREMENTS for why."""
     with pymupdf.open(pdf_path) as pdf:
@@ -145,13 +145,13 @@ def is_empty(value: Any) -> bool:
     return value is None or not str(value).strip()
 
 
-def normalize_for_match(value: Any) -> str:
+def normalize_value_for_match(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
 def string_similarity(a: Any, b: Any) -> float:
     """0..1 character-level similarity of two values after whitespace/case normalization (difflib ratio)."""
-    a, b = normalize_for_match(a), normalize_for_match(b)
+    a, b = normalize_value_for_match(a), normalize_value_for_match(b)
     if not a and not b:
         return 1.0
     return difflib.SequenceMatcher(None, a, b).ratio()
@@ -174,7 +174,7 @@ def vendor_key(name: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def normalize_bbox(bbox: list[float], width: float, height: float) -> list[float] | None:
+def bbox_to_page_fractions(bbox: list[float], width: float, height: float) -> list[float] | None:
     """Raw [x, y, w, h] in page units -> page fractions. None for empty boxes and boxes that leave the page."""
     x, y, w, h = (float(v) for v in bbox)
     if w <= 0 or h <= 0 or x + w > width * 1.02 or y + h > height * 1.02:
@@ -182,7 +182,7 @@ def normalize_bbox(bbox: list[float], width: float, height: float) -> list[float
     return [round(min(max(v, 0.0), 1.0), 4) for v in (x / width, y / height, w / width, h / height)]
 
 
-def denormalize_bbox(bbox: list[float] | None, width: float, height: float) -> list[float]:
+def bbox_to_page_units(bbox: list[float] | None, width: float, height: float) -> list[float]:
     if not bbox:
         return [0.0, 0.0, 0.0, 0.0]
     x, y, w, h = bbox
@@ -208,7 +208,7 @@ def bbox_center(bbox: list[float]) -> tuple[float, float]:
     return x + w / 2, y + h / 2
 
 
-def bbox_overlap(a: list[float] | None, b: list[float] | None) -> float:
+def bbox_iou(a: list[float] | None, b: list[float] | None) -> float:
     """Intersection over union of two [x, y, w, h] boxes; 0.0 when either is missing."""
     if not a or not b:
         return 0.0
@@ -221,7 +221,7 @@ def bbox_overlap(a: list[float] | None, b: list[float] | None) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def center_distance(a: list[float] | None, b: list[float] | None) -> float | None:
+def bbox_center_distance(a: list[float] | None, b: list[float] | None) -> float | None:
     """Euclidean distance between box centres in page fractions (0 = same spot, ~1.4 = opposite corners)."""
     if not a or not b:
         return None
@@ -234,11 +234,11 @@ def center_distance(a: list[float] | None, b: list[float] | None) -> float | Non
 # ---------------------------------------------------------------------------
 
 
-def _is_label_token(text: str) -> bool:
+def _is_label_word(text: str) -> bool:
     return bool(re.search(r"[A-Za-z]", text)) or text in {"#", "#:"}
 
 
-def anchor_label(words: list[tuple], bbox: list[float], max_gap: float = 200, max_words: int = 5) -> str:
+def label_next_to_value(words: list[tuple], bbox: list[float], max_gap: float = 200, max_words: int = 5) -> str:
     """`words` are (x0, y0, x1, y1, text) in PDF points and `bbox` is a raw [x, y, w, h] value box."""
     x, y, w, h = bbox
     cy = y + h / 2
@@ -246,7 +246,7 @@ def anchor_label(words: list[tuple], bbox: list[float], max_gap: float = 200, ma
     def outside(wd: tuple) -> bool:
         return not (wd[0] >= x - 1 and wd[2] <= x + w + 1 and wd[1] >= y - 1 and wd[3] <= y + h + 1)
 
-    labels = [wd for wd in words if _is_label_token(wd[4]) and outside(wd)]
+    labels = [wd for wd in words if _is_label_word(wd[4]) and outside(wd)]
     left = sorted((wd for wd in labels if wd[1] <= cy <= wd[3] and wd[2] <= x + 1 and x - wd[2] < max_gap),
                   key=lambda wd: wd[0])
     if left:
@@ -269,12 +269,12 @@ def anchor_label(words: list[tuple], bbox: list[float], max_gap: float = 200, ma
 # ---------------------------------------------------------------------------
 
 
-def _grounded(word_index: Any) -> bool:
+def _points_into_ocr_tokens(word_index: Any) -> bool:
     """True when word_index points into the page's OCR tokens: [[page, token]] (not [], [[]] or [None])."""
     return bool(word_index) and isinstance(word_index[0], list) and len(word_index[0]) == 2
 
 
-def flatten_document(doc_id: str, pages_json: list[dict], page_facts: dict[int, dict]) -> dict[str, Any]:
+def document_to_record(doc_id: str, pages_json: list[dict], page_facts: dict[int, dict]) -> dict[str, Any]:
     """One output-schema document (ground truth, a saved Gemini pass, or a fabricated doc) -> a flat record:
 
     {doc_id, vendor_name, vendor_key, page_count, is_scanned,
@@ -291,15 +291,15 @@ def flatten_document(doc_id: str, pages_json: list[dict], page_facts: dict[int, 
             for v in section["values"]:
                 value = "" if is_empty(v.get("original_value")) else str(v["original_value"]).strip()
                 raw = (v.get("value_bbox") or [[0, 0, 0, 0]])[0]
-                bbox = normalize_bbox(raw, facts["width"], facts["height"]) if value else None
+                bbox = bbox_to_page_fractions(raw, facts["width"], facts["height"]) if value else None
                 # Gemini passes have word_index [] by design, so only ground truth is held to grounding.
-                grounded = _grounded(v.get("word_index")) or v.get("model_selected") != ["M41"]
+                grounded = _points_into_ocr_tokens(v.get("word_index")) or v.get("model_selected") != ["M41"]
                 valid = bool(v.get("valid", True))
                 usable = bool(value) and grounded and valid and bbox is not None
                 fields[v["key"]] = {
                     "value": value,
                     "bbox": bbox if usable else None,
-                    "label": anchor_label(facts["words"], raw) if usable and facts["words"] else "",
+                    "label": label_next_to_value(facts["words"], raw) if usable and facts["words"] else "",
                     "valid": valid,
                     "usable": usable,
                 }
@@ -314,7 +314,7 @@ def flatten_document(doc_id: str, pages_json: list[dict], page_facts: dict[int, 
                         value = "" if is_empty(cell.get("original_value")) else str(cell["original_value"]).strip()
                         raw = (cell.get("value_bbox") or [[0, 0, 0, 0]])[0]
                         cells[column] = {"value": value,
-                                         "bbox": normalize_bbox(raw, facts["width"], facts["height"]) if value else None}
+                                         "bbox": bbox_to_page_fractions(raw, facts["width"], facts["height"]) if value else None}
                     rows.append(cells)
                 tables.append({"type": table["original_value"], "rows": rows})
         pages.append({"number": number, "fields": fields, "tables": tables})
@@ -330,7 +330,7 @@ def flatten_document(doc_id: str, pages_json: list[dict], page_facts: dict[int, 
     }
 
 
-def fill_vector(page: dict) -> list[float]:
+def presence_vector(page: dict) -> list[float]:
     """Structure signature of one page: 1 for every filled key-value entity and every table type present.
     A leading constant 1 keeps the vector non-zero, so cosine similarity is always defined."""
     vec = [1.0]
@@ -340,7 +340,7 @@ def fill_vector(page: dict) -> list[float]:
     return vec
 
 
-def cosine(a: list[float], b: list[float]) -> float:
+def cosine_similarity(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     na, nb = sum(x * x for x in a) ** 0.5, sum(y * y for y in b) ** 0.5
     return dot / (na * nb) if na and nb else 0.0
@@ -352,7 +352,7 @@ def cosine(a: list[float], b: list[float]) -> float:
 # ---------------------------------------------------------------------------
 
 
-def soft_bins(cx: float, cy: float, grid: int) -> list[float]:
+def bilinear_grid_weights(cx: float, cy: float, grid: int) -> list[float]:
     """Bilinear weights of one point over the centres of a grid x grid page grid (row-major, sums to 1). A centre
     near a cell edge is shared with the neighbouring cell, so a small shift changes the vector only a little."""
     def axis(v: float) -> dict[int, float]:
@@ -368,25 +368,25 @@ def soft_bins(cx: float, cy: float, grid: int) -> list[float]:
     return out
 
 
-def position_vector(page: dict, grid: int) -> list[float]:
+def box_position_vector(page: dict, grid: int) -> list[float]:
     """Per entity (KV_KEYS order), the soft bins of its value box centre; all zero when it has no usable box."""
     vec = []
     for key in KV_KEYS:
         bbox = None if key in DEFAULTED_KEYS else page["fields"].get(key, {}).get("bbox")
-        vec += soft_bins(*bbox_center(bbox), grid) if bbox else [0.0] * (grid * grid)
+        vec += bilinear_grid_weights(*bbox_center(bbox), grid) if bbox else [0.0] * (grid * grid)
     return vec
 
 
 def structure_vector(page: dict, grid: int, weight: float) -> list[float]:
-    """fill_vector (which fields and tables) followed by the weighted position bins (roughly where)."""
-    return fill_vector(page) + [weight * v for v in position_vector(page, grid)]
+    """presence_vector (which fields and tables) followed by the weighted position bins (roughly where)."""
+    return presence_vector(page) + [weight * v for v in box_position_vector(page, grid)]
 
 
-def box_range(cx: float, cy: float, margin: float) -> list[float]:
+def square_range(cx: float, cy: float, margin: float) -> list[float]:
     return [max(cx - margin, 0.0), max(cy - margin, 0.0), min(cx + margin, 1.0), min(cy + margin, 1.0)]
 
 
-def in_range(point: tuple[float, float] | None, rng: list[float] | None) -> bool:
+def point_in_range(point: tuple[float, float] | None, rng: list[float] | None) -> bool:
     return bool(point and rng) and rng[0] <= point[0] <= rng[2] and rng[1] <= point[1] <= rng[3]
 
 
@@ -394,7 +394,7 @@ def range_area(rng: list[float]) -> float:
     return max(rng[2] - rng[0], 0.0) * max(rng[3] - rng[1], 0.0)
 
 
-def range_overlap(a: list[float], b: list[float]) -> float:
+def range_overlap_area(a: list[float], b: list[float]) -> float:
     """Area of the intersection of two ranges."""
     return max(min(a[2], b[2]) - max(a[0], b[0]), 0.0) * max(min(a[3], b[3]) - max(a[1], b[1]), 0.0)
 
@@ -403,7 +403,7 @@ def range_to_bbox(rng: list[float]) -> list[float]:
     return [rng[0], rng[1], rng[2] - rng[0], rng[3] - rng[1]]
 
 
-def keys_related(a: str, b: str) -> bool:
+def vendor_keys_related(a: str, b: str) -> bool:
     """Two different vendor keys that are probably spellings of one vendor: one's words start the other's
     ('konoike pacific california' / 'konoike pacific california dba kpac'), or they share at least half their words."""
     ta, tb = a.split(), b.split()
@@ -413,7 +413,7 @@ def keys_related(a: str, b: str) -> bool:
     return longer[:len(short)] == short or len(set(ta) & set(tb)) / len(set(ta) | set(tb)) >= 0.5
 
 
-def normalize_log(log_scores: dict[str, float]) -> dict[str, float]:
+def normalize_log_probabilities(log_scores: dict[str, float]) -> dict[str, float]:
     """Unnormalized log scores -> probabilities that sum to 1 (log-sum-exp, so tiny likelihoods don't underflow)."""
     top = max(log_scores.values())
     weights = {k: math.exp(v - top) for k, v in log_scores.items()}
@@ -429,7 +429,7 @@ def normalize_log(log_scores: dict[str, float]) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
-def compact_to_envelope(prediction: dict, page_facts: dict[int, dict], model: str) -> list[dict]:
+def prediction_to_output_schema(prediction: dict, page_facts: dict[int, dict], model: str) -> list[dict]:
     """A Gemini prediction -> the full output schema, with boxes in page units, so a saved pass file has the same
     shape as ground truth. Scores are null (Gemini gives none) and word_index is [] (no token stream)."""
     by_number = {int(p.get("number", i + 1)): p for i, p in enumerate(prediction.get("pages", []))}
@@ -449,7 +449,7 @@ def compact_to_envelope(prediction: dict, page_facts: dict[int, dict], model: st
                     "key": key, "display_key": key, "original_value": value,
                     "key_score": None, "value_score": None, "word_index": [],
                     "key_bbox": [[0, 0, 0, 0]],
-                    "value_bbox": [denormalize_bbox(bbox, facts["width"], facts["height"])],
+                    "value_bbox": [bbox_to_page_units(bbox, facts["width"], facts["height"])],
                     "model_selected": [model], "valid": True,
                 })
             sections.append({"name": section, "order": 1, "values": values})
@@ -486,7 +486,7 @@ _BOX_SCHEMA = types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.
                            description="[ymin, xmin, ymax, xmax] on a 0-1000 page grid; [] when the value is empty")
 
 
-def extraction_schema() -> types.Schema:
+def gemini_response_schema() -> types.Schema:
     """Constrained-decoding schema for one document."""
     field = types.Schema(type=types.Type.OBJECT, properties={
         "value": types.Schema(type=types.Type.STRING), "box_2d": _BOX_SCHEMA}, required=["value", "box_2d"])
@@ -505,7 +505,7 @@ def extraction_schema() -> types.Schema:
                         required=["pages"])
 
 
-def catalog_text() -> str:
+def entity_catalog_text() -> str:
     lines = ["NORMALIZATION RULES"] + [f"  {name:<9} {rule}" for name, rule in NORMALIZATION_RULES.items()]
     lines += ["", "KEY-VALUE FIELDS (one set per page)"]
     for section, keys in SECTIONS.items():
@@ -518,48 +518,19 @@ def catalog_text() -> str:
     return "\n".join(lines)
 
 
-EXTRACT_PROMPT = """You are an OCR and information-extraction engine for invoices.
-Return one entry in "pages" per PDF page, in page order. On each page, give every key-value field: its value as
-printed (normalized per the rules) and box_2d, the box around the printed value as [ymin, xmin, ymax, xmax] on a
-0-1000 grid of the page. A field not printed on a page gets value "" and box_2d []. Page 2 onward fills header
-fields only when that page re-prints them. "Item Line Table" holds product/service lines and "Expense Table" holds
-invoice-level charges (tax, shipping, fees, discounts); use [] for a table not on the page.
-
-{catalog}
-"""
-
-GUIDED_SUFFIX = """
-MEMORY GUIDE
-The rules below come from a memory of earlier invoices: where each field's value is usually printed and which
-label usually sits next to it. Use them to find fields you would otherwise miss and to place boxes precisely.
-Never copy a value from the memory; always read it from this PDF. If a rule disagrees with what is printed,
-trust the PDF.
-
-{rules}
-"""
-
-GATED_SUFFIX = """
-MEMORY GUIDE WITH CONFIDENCES
-The rules below come from a memory of earlier invoices. Each carries a probability, computed from how well this
-PDF matches the remembered layout and how consistently the value sat in the same region on earlier invoices:
-- "value usually at box_2d [...] (confidence p)": with probability p the value is printed at about that
-  position on this PDF. Use it to find fields you would otherwise miss and to place boxes precisely.
-- "position uncertain": the remembered position is not trustworthy for this PDF; only the label hint is given.
-- "expected with probability p": how likely it is that the field is printed on this page at all.
-Rules that are too unlikely to apply are left out. Never copy a value from the memory; always read it from this
-PDF. If a rule disagrees with what is printed, trust the PDF.
-
-{rules}
-"""
+# Prompts live in src/prompts/ as plain text; {catalog} and {rules} are filled in by the caller.
+_PROMPTS = Path(__file__).parent / "src" / "prompts"
+EXTRACT_PROMPT = (_PROMPTS / "extract.txt").read_text()
+GUIDED_SUFFIX = (_PROMPTS / "guided_suffix.txt").read_text()
+GATED_SUFFIX = (_PROMPTS / "gated_suffix.txt").read_text()
 
 
-
-def _is_transient(exc: BaseException) -> bool:
+def _is_transient_api_error(exc: BaseException) -> bool:
     return isinstance(exc, errors.APIError) and exc.code in (429, 500, 502, 503, 504)
 
 
-with_retries = retry(retry=retry_if_exception(_is_transient), wait=wait_random_exponential(multiplier=1, max=60),
-                     stop=stop_after_attempt(8), reraise=True)
+with_retries = retry(retry=retry_if_exception(_is_transient_api_error),
+                     wait=wait_random_exponential(multiplier=1, max=60), stop=stop_after_attempt(8), reraise=True)
 
 
 def parse_json_response(raw_text: str) -> dict[str, Any]:
@@ -586,7 +557,7 @@ def gemini_extract(client, model: str, pdf_path: Path, system: str, schema: type
 # ---------------------------------------------------------------------------
 
 
-def align_rows(gt_rows: list[dict], pred_rows: list[dict]) -> list[tuple[dict, dict | None]]:
+def align_table_rows(gt_rows: list[dict], pred_rows: list[dict]) -> list[tuple[dict, dict | None]]:
     """Greedy one-to-one matching of ground-truth rows to predicted rows by mean cell similarity.
     Rows are {column: value}. Unmatched ground-truth rows pair with None."""
     pairs, used = [], set()
@@ -601,3 +572,27 @@ def align_rows(gt_rows: list[dict], pred_rows: list[dict]) -> list[tuple[dict, d
     for gi, g in enumerate(gt_rows):
         pairs.append((g, pred_rows[matched[gi]] if gi in matched else None))
     return pairs
+
+
+# Earlier names, kept so gating.ipynb runs unchanged. New code uses the names above.
+pdf_page_facts = read_pdf_page_facts
+normalize_for_match = normalize_value_for_match
+normalize_bbox = bbox_to_page_fractions
+denormalize_bbox = bbox_to_page_units
+bbox_overlap = bbox_iou
+center_distance = bbox_center_distance
+anchor_label = label_next_to_value
+flatten_document = document_to_record
+fill_vector = presence_vector
+cosine = cosine_similarity
+soft_bins = bilinear_grid_weights
+position_vector = box_position_vector
+box_range = square_range
+in_range = point_in_range
+range_overlap = range_overlap_area
+keys_related = vendor_keys_related
+normalize_log = normalize_log_probabilities
+compact_to_envelope = prediction_to_output_schema
+extraction_schema = gemini_response_schema
+catalog_text = entity_catalog_text
+align_rows = align_table_rows

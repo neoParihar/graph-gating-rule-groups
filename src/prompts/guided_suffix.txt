@@ -1,0 +1,8 @@
+
+MEMORY GUIDE
+The rules below come from a memory of earlier invoices: where each field's value is usually printed and which
+label usually sits next to it. Use them to find fields you would otherwise miss and to place boxes precisely.
+Never copy a value from the memory; always read it from this PDF. If a rule disagrees with what is printed,
+trust the PDF.
+
+{rules}

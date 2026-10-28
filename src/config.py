@@ -14,6 +14,12 @@ class Config:
     neo4j_user: str = "neo4j"
     neo4j_password: str = "gating-local"
 
+    # --- Gemini (src/llm.py) -------------------------------------------------------------------------------------
+    gcp_project: str = "rahhh"
+    gcp_location: str = "global"
+    ocr_model: str = "gemini-2.5-flash"
+    gated_pass_name: str = "rule_groups_gated"   # results/<name>/ for the gated pass with rule-group guidance
+
     # --- Data ----------------------------------------------------------------------------------------------------
     data_dir: Path = field(default_factory=lambda: Path.cwd().parent / "data")   # holds input/ (PDFs), output/ (GT)
     results_dir: Path = Path("results")         # saved Gemini passes from gating.ipynb (only Part IV reads them)

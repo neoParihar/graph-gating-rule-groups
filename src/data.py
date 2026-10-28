@@ -55,8 +55,8 @@ class Corpus:
     def load(cls, cfg: Config) -> "Corpus":
         doc_ids = sorted(p.stem for p in cfg.output_dir.glob("*.json") if (cfg.input_dir / f"{p.stem}.pdf").exists())
         assert doc_ids, f"no ground-truth JSON with a matching PDF under {cfg.data_dir.resolve()}: set data_dir"
-        facts = {d: H.pdf_page_facts(cfg.input_dir / f"{d}.pdf") for d in doc_ids}
-        records = {d: H.flatten_document(d, json.loads((cfg.output_dir / f"{d}.json").read_text()), facts[d])
+        facts = {d: H.read_pdf_page_facts(cfg.input_dir / f"{d}.pdf") for d in doc_ids}
+        records = {d: H.document_to_record(d, json.loads((cfg.output_dir / f"{d}.json").read_text()), facts[d])
                    for d in doc_ids}
         _, train, test = proportional_split(records, cfg.train_fraction, cfg.split_seed)
         assert not train & test and len(train) + len(test) == len(records)

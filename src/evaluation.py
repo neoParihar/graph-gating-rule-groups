@@ -15,7 +15,7 @@ import pandas as pd
 import helpers as H
 from src.data import BUCKET_ORDER, NEW, Corpus
 from src.gate import Gate
-from src.posterior import TERM_SETS, LayoutPosterior
+from src.posterior import TERM_SETS, RuleGroupPosterior
 from src.scenarios import Case
 
 
@@ -26,12 +26,12 @@ def evaluate(gate: Gate, cases: list[Case]) -> tuple[pd.DataFrame, pd.DataFrame]
     """(one row per generated page, one row per considered rule with a confidence)."""
     pages, rules = [], []
     for c in cases:
-        g = gate.page_rules(c.evidence, c.vendor_name)
+        g = gate.page_guide(c.evidence, c.vendor_name)
         decisions = [r["gate"] for r in g["rules"] if r["confidence"] is not None]
         base = {"case_id": c.case_id, "study": c.study, "scenario": c.scenario, "doc_id": c.doc_id, "page": c.page,
                 "truth": c.truth, "true_vendor": c.true_vendor}
         pages.append({**base, "map_vendor": g["chosen_vendor"], "correct": g["chosen_vendor"] == c.truth,
-                      "p_true": g["vendor_posterior"].get(c.truth, 0.0), "p_new": g["p_new"],
+                      "p_true": g["vendor_probabilities"].get(c.truth, 0.0), "p_new": g["p_new"],
                       "p_map": g["p_chosen"], "map_is_new": g["chosen"] == NEW,
                       **{f"n_{d}": decisions.count(d) for d in ("box", "label", "withheld")}})
         agree = c.meta.get("agree", {})
@@ -40,10 +40,10 @@ def evaluate(gate: Gate, cases: list[Case]) -> tuple[pd.DataFrame, pd.DataFrame]
             if r["confidence"] is None or not f or not f["usable"]:
                 continue
             rules.append({**base, "entity": r["name"], "confidence": r["confidence"], "gate": r["gate"],
-                          "strength": r["strength"], "q": r["q"], "map_vendor": g["chosen_vendor"],
+                          "strength": r["strength"], "reliability": r["reliability"], "map_vendor": g["chosen_vendor"],
                           "map_correct": g["chosen_vendor"] == c.truth,
                           "twin_agrees": agree.get(r["name"]) if agree else None,
-                          "hit": H.in_range(H.bbox_center(f["bbox"]), r["range"])})
+                          "hit": H.point_in_range(H.bbox_center(f["bbox"]), r["range"])})
     return pd.DataFrame(pages), pd.DataFrame(rules)
 
 
@@ -103,14 +103,14 @@ def study_summary(pages: pd.DataFrame, rules: pd.DataFrame, by=("study", "scenar
     return p.join(r).round(3)
 
 
-def identification(posterior: LayoutPosterior, cases: list[Case]) -> pd.DataFrame:
+def identification(posterior: RuleGroupPosterior, cases: list[Case]) -> pd.DataFrame:
     """Which evidence identifies the group? Per scenario and evidence set: top-1 accuracy of the MAP vendor, mean
     probability of the right answer, and log loss (punishes confident mistakes)."""
     rows = []
     for c in cases:
-        scores = posterior.scores(c.evidence, c.vendor_name)
+        log_terms = posterior.evidence_log_terms(c.evidence, c.vendor_name)
         for set_name, terms in TERM_SETS.items():
-            vp = posterior.vendor_posterior(scores, posterior.posterior(scores, terms))
+            vp = posterior.vendor_probabilities(log_terms, posterior.group_probabilities(log_terms, terms))
             best = max(vp, key=vp.get)
             rows.append({"study": c.study, "scenario": c.scenario, "evidence": set_name, "correct": best == c.truth,
                          "p_true": vp.get(c.truth, 0.0)})
@@ -149,9 +149,9 @@ def score_prediction(pred: dict, gt: dict, tolerance: float) -> list[dict]:
             rows.append({
                 "doc_id": gt["doc_id"], "page": gt_page["number"], "entity": key,
                 "gt_filled": bool(g["value"]), "pred_filled": bool(p["value"]),
-                "exact": H.normalize_for_match(p["value"]) == H.normalize_for_match(g["value"]),
-                "bbox_overlap": H.bbox_overlap(p["bbox"], g["bbox"]) if g["usable"] else None,
-                "center_within_tol": (bool(p["bbox"]) and H.in_range(H.bbox_center(p["bbox"]), H.box_range(
+                "exact": H.normalize_value_for_match(p["value"]) == H.normalize_value_for_match(g["value"]),
+                "bbox_overlap": H.bbox_iou(p["bbox"], g["bbox"]) if g["usable"] else None,
+                "center_within_tol": (bool(p["bbox"]) and H.point_in_range(H.bbox_center(p["bbox"]), H.square_range(
                     *H.bbox_center(g["bbox"]), tolerance))) if g["usable"] else None,
             })
     return rows
@@ -174,7 +174,7 @@ def llm_fields(corpus: Corpus) -> pd.DataFrame | None:
             path = Path(results) / folder / f"{doc_id}.json"
             if not path.exists():
                 continue
-            pred = H.flatten_document(doc_id, json.loads(path.read_text()), corpus.page_facts[doc_id])
+            pred = H.document_to_record(doc_id, json.loads(path.read_text()), corpus.page_facts[doc_id])
             rows += [{**r, "setup": setup}
                      for r in score_prediction(pred, corpus.records[doc_id], corpus.cfg.bbox_tolerance)]
     if not rows:

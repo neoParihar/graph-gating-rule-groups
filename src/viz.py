@@ -149,19 +149,20 @@ def term_bars(explain: pd.DataFrame, ax=None, title: str = "Which evidence rules
     best), so the candidate axis sits on the right, at 0."""
     terms = list(TERM_NAMES)
     rel = explain[terms] - explain[terms].max()
+
     def short(name: str, n: int = 26) -> str:
         return name if len(name) <= n else name[:n - 1] + "…"
 
     def label(i: str) -> str:
-        if "vendor_posterior" not in explain:          # one row per layout
+        if "vendor_probability" not in explain:        # one row per group
             name = "NEW (unlike any in memory)" if i == "NEW" else \
                 f"{short(explain.at[i, 'vendor'])} ({' '.join(i.split('|')[-2:])})"
-            return f"{name}\nprobability {explain.at[i, 'posterior']:.2f}"
-        p = f"probability {explain.at[i, 'vendor_posterior']:.2f}"   # one row per vendor: its best layout
+            return f"{name}\nprobability {explain.at[i, 'probability']:.2f}"
+        p = f"probability {explain.at[i, 'vendor_probability']:.2f}"   # one row per vendor: its best group
         if i == "NEW":
             return f"NEW · {p}\nunlike any rule group in memory"
         kind = {"g": "rule group", "v": "variant"}.get(i.rsplit("|", 1)[-1][0], "layout")
-        n, pages = int(explain.at[i, "layouts"]), int(explain.at[i, "pages"])
+        n, pages = int(explain.at[i, "groups_competing"]), int(explain.at[i, "training_pages"])
         which = f"best of its {n} {kind}s" if n > 1 else f"its only {kind}"
         return f"{short(explain.at[i, 'vendor'])} · {p}\n{which}, {pages} training page{'s' if pages != 1 else ''}"
 

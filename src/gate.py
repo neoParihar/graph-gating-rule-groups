@@ -1,10 +1,9 @@
-"""From the layout posterior to a confidence per rule, and the gate (gating.ipynb, "From the layout posterior to a
-confidence for each rule").
+"""From the rule-group posterior to a confidence per rule, and the gate.
 
-    conf_k = P(c_k ∈ R_{L*,k} | e) = Σ_L P(L | e) · P(c_k ∈ R_{L*,k} | L)
+    conf_k = P(c_k ∈ R_{G*,k} | e) = Σ_G P(G | e) · P(c_k ∈ R_{G*,k} | G)
 
-| confidence           | what the model is shown                         |
-|----------------------|-------------------------------------------------|
+| confidence           | what the model is shown                          |
+|----------------------|--------------------------------------------------|
 | >= gate_box          | the rule's typical box and its confidence        |
 | gate_label..gate_box | label hint only, "position uncertain"            |
 | < gate_label         | nothing: the rule is withheld                    |
@@ -16,105 +15,108 @@ import pandas as pd
 
 import helpers as H
 from src.data import NEW
-from src.memory_graph import BOX_KEYS, FEATURES, MemoryGraph
-from src.posterior import LayoutPosterior
+from src.posterior import RuleGroupPosterior
+from src.rule_memory import RuleMemory
+from src.schema import BOX_KEYS, FEATURES, page_type
 
 GATES = ("box", "label", "withheld")
 
 
 class Gate:
-    def __init__(self, posterior: LayoutPosterior, graph: MemoryGraph):
+    def __init__(self, posterior: RuleGroupPosterior, memory: RuleMemory):
         self.post = posterior
-        self.graph = graph
+        self.memory = memory
 
     @property
     def cfg(self):
         return self.post.cfg
 
-    def with_posterior(self, posterior: LayoutPosterior) -> "Gate":
-        return Gate(posterior, self.graph)
+    def with_posterior(self, posterior: RuleGroupPosterior) -> "Gate":
+        return Gate(posterior, self.memory)
 
-    def hit_given_layout(self, layout_id: str, key: str, chosen: str) -> float:
-        """P(c_k ∈ R_{L*,k} | L): how likely the value sits in the shown range if the page really is `layout_id`."""
-        rule = self.post.vendor_layouts[chosen]["rules"][key]
+    def in_range_probability(self, group_id: str, key: str, chosen: str) -> float:
+        """P(c_k ∈ R_{G*,k} | G): how likely the value sits in the chosen group's range if the page really is from
+        `group_id`."""
+        rule = self.post.groups[chosen]["rules"][key]
         r_star, a_star = rule["range"], H.range_area(rule["range"])
-        if layout_id == chosen:
-            return rule["q"]                                   # the rule's own reliability
-        other = None if layout_id == NEW else self.post.vendor_layouts[layout_id]["rules"].get(key)
+        if group_id == chosen:
+            return rule["reliability"]                                 # the rule's own reliability
+        other = None if group_id == NEW else self.post.groups[group_id]["rules"].get(key)
         if other is None:
-            return a_star                                      # a value placed uniformly lands in R* by its area
-        a, inter = H.range_area(other["range"]), H.range_overlap(other["range"], r_star)
-        return other["q"] * inter / a + (1 - other["q"]) * (a_star - inter) / (1 - a)
+            return a_star                                              # a value placed uniformly lands in R* by its area
+        a, inter = H.range_area(other["range"]), H.range_overlap_area(other["range"], r_star)
+        return other["reliability"] * inter / a + (1 - other["reliability"]) * (a_star - inter) / (1 - a)
 
-    def rule_confidence(self, post: dict[str, float], key: str, chosen: str) -> float | None:
-        """Σ_L P(L | e) P(c_k ∈ R_{L*,k} | L), by the law of total probability. None when L* has no range for k."""
-        if key not in self.post.vendor_layouts[chosen]["rules"]:
+    def rule_confidence(self, probabilities: dict[str, float], key: str, chosen: str) -> float | None:
+        """Σ_G P(G | e) P(c_k ∈ R_{G*,k} | G), by the law of total probability. None when G* has no range for k."""
+        if key not in self.post.groups[chosen]["rules"]:
             return None
-        return sum(p * self.hit_given_layout(layout_id, key, chosen) for layout_id, p in post.items())
+        return sum(p * self.in_range_probability(group_id, key, chosen) for group_id, p in probabilities.items())
 
     def confidence_breakdown(self, page: dict, vendor_name: str, key: str, top: int = 5) -> pd.DataFrame:
-        """The sum behind one rule's confidence, term by term: for the most probable layouts, P(L | e), the chance
-        the value is in the MAP layout's range if the page were L, and their product. The rest is lumped."""
-        scores = self.post.scores(page, vendor_name)
-        post = self.post.posterior(scores)
-        chosen = max(post, key=post.get)
-        if chosen == NEW or key not in self.post.vendor_layouts[chosen]["rules"]:
+        """The sum behind one rule's confidence, term by term: for the most probable groups, P(G | e), the chance the
+        value is in the chosen group's range if the page were from G, and their product. The rest is lumped."""
+        log_terms = self.post.evidence_log_terms(page, vendor_name)
+        probabilities = self.post.group_probabilities(log_terms)
+        chosen = max(probabilities, key=probabilities.get)
+        if chosen == NEW or key not in self.post.groups[chosen]["rules"]:
             return pd.DataFrame()
-        rows = [{"layout": i, "vendor": scores.at[i, "vendor"], "is_map": i == chosen, "p_layout": p,
-                 "p_in_range_if_layout": self.hit_given_layout(i, key, chosen)} for i, p in post.items()]
-        df = pd.DataFrame(rows).sort_values("p_layout", ascending=False)
-        df["contribution"] = df.p_layout * df.p_in_range_if_layout
+        rows = [{"group": i, "vendor": log_terms.at[i, "vendor"], "is_chosen": i == chosen, "p_group": p,
+                 "p_in_range_if_group": self.in_range_probability(i, key, chosen)} for i, p in probabilities.items()]
+        df = pd.DataFrame(rows).sort_values("p_group", ascending=False)
+        df["contribution"] = df.p_group * df.p_in_range_if_group
         head, rest = df.head(top), df.iloc[top:]
         if not rest.empty:
-            head = pd.concat([head, pd.DataFrame([{"layout": f"{len(rest)} others", "vendor": "", "is_map": False,
-                                                   "p_layout": rest.p_layout.sum(),
-                                                   "p_in_range_if_layout": None,
+            head = pd.concat([head, pd.DataFrame([{"group": f"{len(rest)} others", "vendor": "", "is_chosen": False,
+                                                   "p_group": rest.p_group.sum(), "p_in_range_if_group": None,
                                                    "contribution": rest.contribution.sum()}])])
         return head.reset_index(drop=True)
 
-    def decide(self, conf: float | None) -> str:
-        if conf is None:
+    def decision(self, confidence: float | None) -> str:
+        if confidence is None:
             return "no_position"
-        return "box" if conf >= self.cfg.gate_box else "label" if conf >= self.cfg.gate_label else "withheld"
+        return "box" if confidence >= self.cfg.gate_box else "label" if confidence >= self.cfg.gate_label else \
+            "withheld"
 
-    def page_rules(self, page: dict, vendor_name: str) -> dict:
-        """The gated guide for one page: posterior summary, the MAP layout, and every rule of it with its confidence
-        and gate decision (withheld rules included, so they can be evaluated)."""
-        pn = min(page["number"], 2)
-        scores = self.post.scores(page, vendor_name)
-        post = self.post.posterior(scores)
-        chosen = max(post, key=post.get)
-        vp = self.post.vendor_posterior(scores, post)
-        p_filled = sum(p * self.post.theta(NEW if i == NEW else self.post.vendor_layouts[i], pn)
-                       for i, p in post.items())
-        out = {"page": page["number"], "vendor_key": H.vendor_key(vendor_name), "chosen": chosen,
-               "chosen_vendor": scores.at[chosen, "vendor"], "p_chosen": post[chosen], "p_new": post[NEW],
-               "vendor_posterior": vp, "top_layouts": dict(sorted(post.items(), key=lambda kv: -kv[1])[:5]),
-               "rules": [], "tables": []}
+    def page_guide(self, page: dict, vendor_name: str) -> dict:
+        """The gated guide for one page: the posterior summary, the chosen (most probable) group, and every rule of
+        it with its confidence and gate decision (withheld rules included, so they can be evaluated)."""
+        pt = page_type(page)
+        log_terms = self.post.evidence_log_terms(page, vendor_name)
+        probabilities = self.post.group_probabilities(log_terms)
+        chosen = max(probabilities, key=probabilities.get)
+        p_filled = sum(p * self.post.smoothed_fill_rates(NEW if i == NEW else self.post.groups[i], pt)
+                       for i, p in probabilities.items())
+        guide = {"page": page["number"], "vendor_key": H.vendor_key(vendor_name), "chosen": chosen,
+                 "chosen_vendor": log_terms.at[chosen, "vendor"], "p_chosen": probabilities[chosen],
+                 "p_new": probabilities[NEW],
+                 "vendor_probabilities": self.post.vendor_probabilities(log_terms, probabilities),
+                 "top_groups": dict(sorted(probabilities.items(), key=lambda kv: -kv[1])[:5]),
+                 "rules": [], "tables": []}
         if chosen == NEW:
-            return out
-        L = self.post.vendor_layouts[chosen]
-        out["chosen_docs"] = L["docs"]
+            return guide
+        G = self.post.groups[chosen]
+        guide["chosen_pages"] = G["pages"]
         for key in BOX_KEYS:
-            rule = L["rules"].get(key, {})
-            conf = self.rule_confidence(post, key, chosen)
-            out["rules"].append({"name": key, "confidence": conf, "gate": self.decide(conf),
-                                 "p_filled": float(p_filled[FEATURES.index(key)]), "range": rule.get("range"),
-                                 "bbox_median": rule.get("bbox_median"), "q": rule.get("q"),
-                                 "strength": rule.get("strength", "none"), "labels": L["labels"].get(key) or []})
+            rule = G["rules"].get(key, {})
+            confidence = self.rule_confidence(probabilities, key, chosen)
+            guide["rules"].append({"name": key, "confidence": confidence, "gate": self.decision(confidence),
+                                   "p_filled": float(p_filled[FEATURES.index(key)]), "range": rule.get("range"),
+                                   "bbox_median": rule.get("bbox_median"), "reliability": rule.get("reliability"),
+                                   "strength": rule.get("strength", "none"), "labels": G["labels"].get(key) or []})
         for table in H.TABLE_TYPES:
-            out["tables"].append({"name": table, "p_present": float(p_filled[FEATURES.index(table)])})
-        return out
+            guide["tables"].append({"name": table, "p_present": float(p_filled[FEATURES.index(table)])})
+        return guide
 
-    def rules_to_text(self, guide: dict) -> str:
-        """Render a gated guide as prompt text: only rules that passed the gate, each with its probabilities."""
+    def guide_text(self, guide: dict) -> str:
+        """A page guide as prompt text: only rules that passed the gate, each with its probabilities."""
         lines = [f"PAGE {guide['page']}"]
         if guide["chosen"] == NEW:
             lines.append(f"  No remembered layout fits this page (P(unseen layout) = {guide['p_new']:.2f}); no "
                          "vendor-specific rules.")
         else:
-            lines.append(f"  Layout from vendor tree '{guide['chosen_vendor']}' (P(this layout | page) = "
-                         f"{guide['p_chosen']:.2f}, built from {guide['chosen_docs']} invoice(s)):")
+            lines.append(f"  Layout from vendor '{guide['chosen_vendor']}' (P(this layout | page) = "
+                         f"{guide['p_chosen']:.2f}, built from {guide['chosen_pages']} invoice page(s)):")
             for r in guide["rules"]:
                 labels = f"; labelled {', '.join(repr(l) for l in r['labels'])}" if r["labels"] else ""
                 if r["gate"] == "box":
@@ -127,13 +129,13 @@ class Gate:
                 else:
                     continue
                 lines.append(f"    {r['name']}: expected with probability {r['p_filled']:.2f}; {where}{labels}")
-            columns = {r.name: r.top_labels for r in self.graph.layout_rules(guide["chosen"]).itertuples()
+            columns = {r.name: r.top_labels for r in self.memory.group_path_rules(guide["chosen"]).itertuples()
                        if r.kind == "table"}
             for t in guide["tables"]:
                 if t["p_present"] >= 0.5:
                     lines.append(f"    TABLE {t['name']}: present with probability {t['p_present']:.2f}; usually "
                                  f"filled columns: {', '.join(columns.get(t['name'], [])) or '-'}")
-        corpus = self.post.corpus_layouts[min(guide["page"], 2)]["labels"]
+        corpus = self.post.corpus_views[page_type({"number": guide["page"]})]["labels"]
         lines.append("  Labels common across all vendors:")
         lines += [f"    {k}: {', '.join(repr(l) for l in corpus[k])}" for k in BOX_KEYS if corpus.get(k)]
         return "\n".join(lines)

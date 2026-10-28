@@ -28,7 +28,8 @@ import pandas as pd
 import helpers as H
 from src.config import Config
 from src.data import NEW, Corpus
-from src.memory_graph import ALL_VENDORS, BOX_KEYS, MemoryGraph
+from src.rule_memory import RuleMemory
+from src.schema import BOX_KEYS, page_type
 
 _NAME_A = ["Harbor", "Ironwood", "Bluefield", "Copper Ridge", "Northgate", "Silverline", "Oakmont", "Redstone",
            "Lakeshore", "Summit", "Granite Peak", "Westbrook", "Pinecrest", "Brightwater", "Stonebridge"]
@@ -58,7 +59,7 @@ class Case:
 # --- Transformations --------------------------------------------------------------------------------------------
 
 
-def _move(bbox: list[float], cx: float, cy: float) -> list[float]:
+def move_box_centre(bbox: list[float], cx: float, cy: float) -> list[float]:
     """The box with its centre moved to (cx, cy), kept on the page."""
     x, y, w, h = bbox
     cx, cy = min(max(cx, w / 2), 1 - w / 2), min(max(cy, h / 2), 1 - h / 2)
@@ -79,10 +80,10 @@ def add_noise(page: dict, rng: random.Random, box_miss: float, field_miss: float
                 page["fields"][key] = {**f, "value": "", "bbox": None, "usable": False}
             elif f["bbox"] and sigma > 0:
                 cx, cy = H.bbox_center(f["bbox"])
-                f["bbox"] = _move(f["bbox"], cx + rng.gauss(0, sigma), cy + rng.gauss(0, sigma))
+                f["bbox"] = move_box_centre(f["bbox"], cx + rng.gauss(0, sigma), cy + rng.gauss(0, sigma))
         elif rng.random() < false_fill:
-            page["fields"][key] = {**f, "value": "?", "bbox": _move([0, 0, 0.1, 0.012], rng.random(), rng.random()),
-                                   "usable": False}
+            page["fields"][key] = {**f, "value": "?", "bbox": move_box_centre([0, 0, 0.1, 0.012], rng.random(),
+                                                                                  rng.random()), "usable": False}
     return page
 
 
@@ -92,7 +93,7 @@ def shift_page(page: dict, dx: float, dy: float) -> dict:
     for f in page["fields"].values():
         if f["bbox"]:
             cx, cy = H.bbox_center(f["bbox"])
-            f["bbox"] = _move(f["bbox"], cx + dx, cy + dy)
+            f["bbox"] = move_box_centre(f["bbox"], cx + dx, cy + dy)
     return page
 
 
@@ -125,25 +126,25 @@ def fresh_names(n: int, rng: random.Random, taken: set[str]) -> list[str]:
 # --- Structural twins -------------------------------------------------------------------------------------------
 
 
-def find_twins(graph: MemoryGraph, min_similarity: float, min_shared_rules: int = 1) -> pd.DataFrame:
-    """Pairs of PageLayouts of *different* vendors, same page number, whose structure vectors (which fields, and
-    roughly where) have cosine >= min_similarity. Per pair: how many located rules they share, and on how many of
-    those their ranges overlap (the twins "agree" on where the value is). Pairs sharing fewer than
+def find_twins(memory: RuleMemory, min_similarity: float, min_shared_rules: int = 1) -> pd.DataFrame:
+    """Pairs of rule groups of *different* vendors, same page type, whose structure vectors (which nodes, and
+    roughly where) have similarity >= min_similarity. Per pair: how many located rules they share, and on how many
+    of those their ranges overlap (the twins "agree" on where the value is). Pairs sharing fewer than
     min_shared_rules located entities (e.g. near-empty continuation pages) are dropped."""
-    rows = graph.similar_layout_pairs(min_similarity)
-    layouts = graph.layouts()
+    rows = memory.similar_group_pairs(min_similarity)
+    groups = memory.rule_groups()
     for r in rows:
-        agree = entity_agreement(layouts[r["layout_a"]], layouts[r["layout_b"]])
+        agree = rules_overlap(groups[r["group_a"]], groups[r["group_b"]])
         r["shared_rules"] = len(agree)
         r["agreeing_rules"] = sum(agree.values())
     df = pd.DataFrame(rows)
     return df[df.shared_rules >= min_shared_rules].reset_index(drop=True) if not df.empty else df
 
 
-def entity_agreement(layout_a: dict, layout_b: dict) -> dict[str, bool]:
-    """For every entity both layouts locate: do their ranges overlap?"""
-    return {k: H.range_overlap(r["range"], layout_b["rules"][k]["range"]) > 0
-            for k, r in layout_a["rules"].items() if k in layout_b["rules"]}
+def rules_overlap(group_a: dict, group_b: dict) -> dict[str, bool]:
+    """For every entity both groups locate: do their ranges overlap?"""
+    return {k: H.range_overlap_area(r["range"], group_b["rules"][k]["range"]) > 0
+            for k, r in group_a["rules"].items() if k in group_b["rules"]}
 
 
 # --- The generator ----------------------------------------------------------------------------------------------
@@ -152,12 +153,10 @@ def entity_agreement(layout_a: dict, layout_b: dict) -> dict[str, bool]:
 class ScenarioGenerator:
     """Builds the test-page studies from the held-out documents. Seeded: the same settings give the same cases."""
 
-    def __init__(self, corpus: Corpus, graph: MemoryGraph, cfg: Config):
-        self.corpus, self.graph, self.cfg = corpus, graph, cfg
+    def __init__(self, corpus: Corpus, memory: RuleMemory, cfg: Config):
+        self.corpus, self.memory, self.cfg = corpus, memory, cfg
         self.test_ids = sorted(corpus.test_ids)
-        self.known_names = {v: n for v, n in ((r["vendor"], r["names"]) for r in graph.cypher(
-            "MATCH (v:Vendor) WHERE NOT v.key IN [$all, $unidentified] RETURN v.key AS vendor, v.names AS names",
-            all=ALL_VENDORS, unidentified=H.UNCLASSIFIED))}
+        self.known_names = memory.vendor_names()
 
     def _rng(self, *salt) -> random.Random:
         return random.Random(f"{self.cfg.scenario_seed}|" + "|".join(map(str, salt)))
@@ -205,21 +204,21 @@ class ScenarioGenerator:
     def twins(self, twins: pd.DataFrame | None = None) -> list[Case]:
         """Test pages of a vendor with a structural twin, seen under its own name, no name, and the twin's name."""
         if twins is None:
-            twins = find_twins(self.graph, self.cfg.twin_min_similarity, self.cfg.twin_min_shared_rules)
-        layouts = self.graph.layouts()
+            twins = find_twins(self.memory, self.cfg.twin_min_similarity, self.cfg.twin_min_shared_rules)
+        groups = self.memory.rule_groups()
         partners: dict[tuple[str, int], list[dict]] = {}
         for r in twins.itertuples():
-            for own, other, own_layout, other_layout in ((r.vendor_a, r.vendor_b, r.layout_a, r.layout_b),
-                                                         (r.vendor_b, r.vendor_a, r.layout_b, r.layout_a)):
+            for own, other, own_group, other_group in ((r.vendor_a, r.vendor_b, r.group_a, r.group_b),
+                                                       (r.vendor_b, r.vendor_a, r.group_b, r.group_a)):
                 partners.setdefault((own, r.page), []).append(
-                    {"twin": other, "own_layout": own_layout, "twin_layout": other_layout, "sim": r.sim})
+                    {"twin": other, "own_group": own_group, "twin_group": other_group, "sim": r.sim})
         cases = []
         for doc_id, rec, page in self._test_pages(seen_only=True):
-            for pair in partners.get((rec["vendor_key"], min(page["number"], 2)), [])[:1]:   # the closest twin
-                agree = entity_agreement(layouts[pair["own_layout"]], layouts[pair["twin_layout"]])
+            for pair in partners.get((rec["vendor_key"], page_type(page)), [])[:1]:   # the closest twin
+                agree = rules_overlap(groups[pair["own_group"]], groups[pair["twin_group"]])
                 twin_name = (self.known_names.get(pair["twin"]) or [pair["twin"]])[0]
                 meta = {"twin": pair["twin"], "twin_similarity": pair["sim"], "agree": agree,
-                        "own_layout": pair["own_layout"], "twin_layout": pair["twin_layout"]}
+                        "own_group": pair["own_group"], "twin_group": pair["twin_group"]}
                 for scenario, name in (("own name", rec["vendor_name"]), ("no name", ""), ("twin's name", twin_name)):
                     cases.append(self._case("E2 twins", scenario, doc_id, page, name, noisy=True, **meta))
         return cases
@@ -280,7 +279,7 @@ def describe_noise(cases: list[Case]) -> pd.Series:
                 n_filled += 1
                 dropped += not e["value"]
                 if g["bbox"] and e["bbox"]:
-                    dist.append(H.center_distance(g["bbox"], e["bbox"]))
+                    dist.append(H.bbox_center_distance(g["bbox"], e["bbox"]))
             else:
                 n_empty += 1
                 invented += bool(e["value"])

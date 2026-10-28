@@ -1,9 +1,10 @@
-"""The posterior over remembered layouts (gating.ipynb, "The posterior over layouts").
+"""Which rule group is this page? The posterior over the remembered rule groups.
 
-    P(L | e) ∝ P(L) · P(k̂ | L) · P(x | L)^(1/T) · p(c | x, L)
+    P(G | e) ∝ P(G) · P(k̂ | G) · P(x | G)^(1/T) · p(c | x, G)
 
-over every vendor PageLayout with the page's number, plus NEW ("a vendor or layout not in memory"), which behaves
-like the ALL_VENDORS tree and has no rules of its own.
+over every rule group of the page's page type, plus NEW ("a page unlike any group in memory"), which behaves like
+the corpus-wide view and has no rules of its own. Each factor is the soft version of one check of the ingestion
+rule: the vendor name, the nodes present, and whether the boxes lie in the rules' ranges.
 """
 
 from __future__ import annotations
@@ -18,119 +19,114 @@ import pandas as pd
 import helpers as H
 from src.config import Config
 from src.data import NEW, Corpus
-from src.memory_graph import ALL_VENDORS, BOX_KEYS, FEATURES, MemoryGraph
+from src.rule_memory import RuleMemory
+from src.schema import BOX_KEYS, CORPUS_VIEW, page_presence, page_type
 
 TERMS = ("prior", "name", "fields", "boxes")
 TERM_SETS = {"prior only": ("prior",), "name": ("prior", "name"), "fields": ("prior", "fields"),
              "boxes": ("prior", "boxes"), "fields + boxes": ("prior", "fields", "boxes"), "all": TERMS}
 
 
-def presence(page: dict) -> np.ndarray:
-    """x: 1 for every filled entity and every table present on the page, in FEATURES order."""
-    filled = {k for k, f in page["fields"].items() if f["value"]} | {t["type"] for t in page["tables"] if t["rows"]}
-    return np.array([float(f in filled) for f in FEATURES])
-
-
-class LayoutPosterior:
-    def __init__(self, graph: MemoryGraph, corpus: Corpus, cfg: Config, p_new: float | None = None):
-        """`graph` is either memory (MemoryGraph or RuleMemory): only its `layouts()` is read. `p_new` overrides
-        the Good–Turing mass of NEW, which defaults to the share of training invoices whose vendor appears once."""
+class RuleGroupPosterior:
+    def __init__(self, memory: RuleMemory, corpus: Corpus, cfg: Config, p_new: float | None = None):
+        """`p_new` is the prior mass of NEW; by default the memory's Good–Turing estimate (`memory.p_new`)."""
         self.cfg = cfg
-        layouts = graph.layouts()
-        self.vendor_layouts = {i: L for i, L in layouts.items() if L["vendor"] != ALL_VENDORS}
-        self.corpus_layouts = {L["page"]: L for L in layouts.values() if L["vendor"] == ALL_VENDORS}
-        self.theta_all = {page: L["n_filled"] / L["docs"] for page, L in self.corpus_layouts.items()}
-        self.known_keys = {L["vendor"] for L in self.vendor_layouts.values()}
-        train_count = corpus.train_count
-        self.p_new = p_new if p_new is not None else \
-            sum(1 for n in train_count.values() if n == 1) / len(corpus.train_ids)            # Good-Turing N1/N
+        groups = memory.rule_groups()
+        self.groups = {i: G for i, G in groups.items() if G["vendor"] != CORPUS_VIEW}
+        self.corpus_views = {G["page"]: G for G in groups.values() if G["vendor"] == CORPUS_VIEW}
+        self.corpus_fill_rates = {page: V["filled_pages"] / V["pages"] for page, V in self.corpus_views.items()}
+        self.known_vendors = {G["vendor"] for G in self.groups.values()}
+        self.p_new = memory.p_new if p_new is None else p_new
 
-    def with_config(self, cfg: Config) -> "LayoutPosterior":
-        """The same posterior with other settings (for sweeps); the graph is not read again."""
-        other = object.__new__(LayoutPosterior)
+    def with_config(self, cfg: Config) -> "RuleGroupPosterior":
+        """The same posterior with other settings (for sweeps); the memory is not read again."""
+        other = object.__new__(RuleGroupPosterior)
         other.__dict__.update(self.__dict__)
         other.cfg = cfg
         return other
 
-    def with_settings(self, **changes) -> "LayoutPosterior":
+    def with_settings(self, **changes) -> "RuleGroupPosterior":
         return self.with_config(replace(self.cfg, **changes))
 
-    def theta(self, L: dict | str, page: int, m: float | None = None) -> np.ndarray:
-        """Smoothed P(feature present | L): the layout's counts shrunk toward the corpus with m pseudo-pages."""
+    def smoothed_fill_rates(self, group: dict | str, pt: int, m: float | None = None) -> np.ndarray:
+        """P(feature present | G): the group's fill rates shrunk toward the corpus view with m pseudo-pages. NEW
+        uses the corpus view itself."""
         m = self.cfg.field_smoothing_m if m is None else m
-        if L == NEW:
-            return self.theta_all[page]
-        return (L["n_filled"] + m * self.theta_all[page]) / (L["docs"] + m)
+        if group == NEW:
+            return self.corpus_fill_rates[pt]
+        return (group["filled_pages"] + m * self.corpus_fill_rates[pt]) / (group["pages"] + m)
 
-    def scores(self, page: dict, vendor_name: str, m: float | None = None) -> pd.DataFrame:
-        """One row per candidate layout (and NEW): the log of each factor of Bayes' rule, before normalization."""
+    def evidence_log_terms(self, page: dict, vendor_name: str, m: float | None = None) -> pd.DataFrame:
+        """One row per candidate group (and NEW): the log of each factor of Bayes' rule, before normalization."""
         cfg = self.cfg
         m = cfg.field_smoothing_m if m is None else m
-        pn = min(page["number"], 2)
-        candidates = [L for L in self.vendor_layouts.values() if L["page"] == pn]
-        pages_here = sum(L["docs"] for L in candidates)
-        x = presence(page)
-        k_hat = H.vendor_key(vendor_name)
-        n_keys = len(self.known_keys)
+        pt = page_type(page)
+        candidates = [G for G in self.groups.values() if G["page"] == pt]
+        pages_here = sum(G["pages"] for G in candidates)
+        present = np.array(page_presence(page))
+        read_key = H.vendor_key(vendor_name)
+        n_vendors = len(self.known_vendors)
         centres = {k: H.bbox_center(f["bbox"]) for k, f in page["fields"].items() if f["bbox"] and k in BOX_KEYS}
         rows = []
-        for L in candidates + [NEW]:
-            is_new = L == NEW
-            # 1. prior: Good-Turing mass for NEW, the rest by training pages per layout
-            prior = self.p_new if is_new else (1 - self.p_new) * L["docs"] / pages_here
+        for G in candidates + [NEW]:
+            is_new = G == NEW
+            # 1. prior: Good–Turing mass for NEW, the rest by training pages per group
+            prior = self.p_new if is_new else (1 - self.p_new) * G["pages"] / pages_here
             # 2. name: noisy channel over vendor keys (exact, variant spelling, unrelated); no name is no evidence
-            if k_hat == H.UNCLASSIFIED:
+            if read_key == H.UNCLASSIFIED:
                 name = 0.0
             elif is_new:
-                name = math.log(1 - cfg.name_error) if k_hat not in self.known_keys else \
-                    math.log(cfg.name_error / n_keys)
-            elif k_hat == L["vendor"]:
+                name = math.log(1 - cfg.name_error) if read_key not in self.known_vendors else \
+                    math.log(cfg.name_error / n_vendors)
+            elif read_key == G["vendor"]:
                 name = math.log(1 - cfg.name_error)
-            elif H.keys_related(k_hat, L["vendor"]):
+            elif H.vendor_keys_related(read_key, G["vendor"]):
                 name = math.log(cfg.name_error * cfg.name_variant)
             else:
-                name = math.log(cfg.name_error * (1 - cfg.name_variant) / n_keys)
+                name = math.log(cfg.name_error * (1 - cfg.name_variant) / n_vendors)
             # 3. fields: Bernoulli naive Bayes through the extraction channel, tempered by 1/T
-            th = self.theta(L, pn, m)
-            p1 = th * (1 - cfg.field_miss) + (1 - th) * cfg.field_false_fill
-            fields = float(np.sum(x * np.log(p1) + (1 - x) * np.log(1 - p1))) / cfg.field_temperature
-            # 4. boxes: piecewise-uniform density around each of L's ranges; 1 (log 0) where L has no range
+            rates = self.smoothed_fill_rates(G, pt, m)
+            p_seen = rates * (1 - cfg.field_miss) + (1 - rates) * cfg.field_false_fill
+            fields = float(np.sum(present * np.log(p_seen) + (1 - present) * np.log(1 - p_seen))) \
+                / cfg.field_temperature
+            # 4. boxes: piecewise-uniform density around each of G's ranges; 1 (log 0) where G has no range
             boxes = 0.0
             for k, c in centres.items():
-                rule = None if is_new else L["rules"].get(k)
+                rule = None if is_new else G["rules"].get(k)
                 if rule:
-                    area = max(H.range_area(rule["range"]), 1e-6)
-                    boxes += math.log(rule["q"] / area) if H.in_range(c, rule["range"]) else \
-                        math.log((1 - rule["q"]) / (1 - area))
-            rows.append({"layout_id": NEW if is_new else L["id"], "vendor": NEW if is_new else L["vendor"],
+                    area, r = max(H.range_area(rule["range"]), 1e-6), rule["reliability"]
+                    boxes += math.log(r / area) if H.point_in_range(c, rule["range"]) else \
+                        math.log((1 - r) / (1 - area))
+            rows.append({"group": NEW if is_new else G["id"], "vendor": NEW if is_new else G["vendor"],
                          "prior": math.log(prior), "name": name, "fields": fields, "boxes": boxes})
-        return pd.DataFrame(rows).set_index("layout_id")
+        return pd.DataFrame(rows).set_index("group")
 
     @staticmethod
-    def posterior(scores: pd.DataFrame, terms: tuple[str, ...] = TERMS) -> dict[str, float]:
-        """P(L | e) over the candidates, using only the chosen factors (for ablation)."""
-        return H.normalize_log(scores[list(terms)].sum(axis=1).to_dict())
+    def group_probabilities(log_terms: pd.DataFrame, terms: tuple[str, ...] = TERMS) -> dict[str, float]:
+        """P(G | e) over the candidates, using only the chosen factors (for ablation)."""
+        return H.normalize_log_probabilities(log_terms[list(terms)].sum(axis=1).to_dict())
 
     @staticmethod
-    def vendor_posterior(scores: pd.DataFrame, post: dict[str, float]) -> dict[str, float]:
-        """P(vendor | e): the posterior summed over each vendor's layouts."""
+    def vendor_probabilities(log_terms: pd.DataFrame, probabilities: dict[str, float]) -> dict[str, float]:
+        """P(vendor | e): the group probabilities summed over each vendor's groups."""
         out = defaultdict(float)
-        for layout_id, p in post.items():
-            out[scores.at[layout_id, "vendor"]] += p
+        for group_id, p in probabilities.items():
+            out[log_terms.at[group_id, "vendor"]] += p
         return dict(out)
 
     def explain(self, page: dict, vendor_name: str, top: int = 6, per_vendor: bool = False) -> pd.DataFrame:
-        """The top candidates with their log-terms, total and posterior: the table behind the term chart.
-        per_vendor keeps one row per vendor, its most probable layout, with the vendor's total probability
-        (`vendor_posterior`), how many of its layouts competed (`layouts`) and the row layout's training pages."""
-        s = self.scores(page, vendor_name)
+        """The top candidates with their log-terms, total and probability: the table behind the term chart.
+        per_vendor keeps one row per vendor, its most probable group, with the vendor's total probability
+        (`vendor_probability`), how many of its groups competed (`groups_competing`) and the row group's training
+        pages (`training_pages`)."""
+        s = self.evidence_log_terms(page, vendor_name)
         s["total"] = s[list(TERMS)].sum(axis=1)
-        s["posterior"] = pd.Series(self.posterior(s))
-        s = s.sort_values("posterior", ascending=False)
+        s["probability"] = pd.Series(self.group_probabilities(s))
+        s = s.sort_values("probability", ascending=False)
         if per_vendor:
             by_vendor = s.groupby("vendor")
-            s = s.assign(vendor_posterior=by_vendor.posterior.transform("sum"),
-                         layouts=by_vendor.posterior.transform("size"),
-                         pages=[0 if i == NEW else self.vendor_layouts[i]["docs"] for i in s.index])
+            s = s.assign(vendor_probability=by_vendor.probability.transform("sum"),
+                         groups_competing=by_vendor.probability.transform("size"),
+                         training_pages=[0 if i == NEW else self.groups[i]["pages"] for i in s.index])
             s = s.drop_duplicates("vendor")
         return s.head(top)
