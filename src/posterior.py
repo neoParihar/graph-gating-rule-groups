@@ -119,9 +119,18 @@ class LayoutPosterior:
             out[scores.at[layout_id, "vendor"]] += p
         return dict(out)
 
-    def explain(self, page: dict, vendor_name: str, top: int = 6) -> pd.DataFrame:
-        """The top candidates with their log-terms, total and posterior: the table behind the term chart."""
+    def explain(self, page: dict, vendor_name: str, top: int = 6, per_vendor: bool = False) -> pd.DataFrame:
+        """The top candidates with their log-terms, total and posterior: the table behind the term chart.
+        per_vendor keeps one row per vendor, its most probable layout, with the vendor's total probability
+        (`vendor_posterior`), how many of its layouts competed (`layouts`) and the row layout's training pages."""
         s = self.scores(page, vendor_name)
         s["total"] = s[list(TERMS)].sum(axis=1)
         s["posterior"] = pd.Series(self.posterior(s))
-        return s.sort_values("posterior", ascending=False).head(top)
+        s = s.sort_values("posterior", ascending=False)
+        if per_vendor:
+            by_vendor = s.groupby("vendor")
+            s = s.assign(vendor_posterior=by_vendor.posterior.transform("sum"),
+                         layouts=by_vendor.posterior.transform("size"),
+                         pages=[0 if i == NEW else self.vendor_layouts[i]["docs"] for i in s.index])
+            s = s.drop_duplicates("vendor")
+        return s.head(top)

@@ -152,9 +152,20 @@ def term_bars(explain: pd.DataFrame, ax=None, title: str = "Which evidence rules
     def short(name: str, n: int = 26) -> str:
         return name if len(name) <= n else name[:n - 1] + "…"
 
-    labels = [("NEW (unlike any in memory)" if i == "NEW" else
-               f"{short(explain.at[i, 'vendor'])} ({' '.join(i.split('|')[-2:])})") +
-              f"\nprobability {explain.at[i, 'posterior']:.2f}" for i in explain.index]
+    def label(i: str) -> str:
+        if "vendor_posterior" not in explain:          # one row per layout
+            name = "NEW (unlike any in memory)" if i == "NEW" else \
+                f"{short(explain.at[i, 'vendor'])} ({' '.join(i.split('|')[-2:])})"
+            return f"{name}\nprobability {explain.at[i, 'posterior']:.2f}"
+        p = f"probability {explain.at[i, 'vendor_posterior']:.2f}"   # one row per vendor: its best layout
+        if i == "NEW":
+            return f"NEW · {p}\nunlike any rule group in memory"
+        kind = {"g": "rule group", "v": "variant"}.get(i.rsplit("|", 1)[-1][0], "layout")
+        n, pages = int(explain.at[i, "layouts"]), int(explain.at[i, "pages"])
+        which = f"best of its {n} {kind}s" if n > 1 else f"its only {kind}"
+        return f"{short(explain.at[i, 'vendor'])} · {p}\n{which}, {pages} training page{'s' if pages != 1 else ''}"
+
+    labels = [label(i) for i in explain.index]
     if ax is None:
         _, ax = plt.subplots(figsize=(8, 0.55 * len(explain) + 1.2))
     y = np.arange(len(explain))
