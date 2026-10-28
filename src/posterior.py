@@ -32,7 +32,9 @@ def presence(page: dict) -> np.ndarray:
 
 
 class LayoutPosterior:
-    def __init__(self, graph: MemoryGraph, corpus: Corpus, cfg: Config):
+    def __init__(self, graph: MemoryGraph, corpus: Corpus, cfg: Config, p_new: float | None = None):
+        """`graph` is either memory (MemoryGraph or RuleMemory): only its `layouts()` is read. `p_new` overrides
+        the Good–Turing mass of NEW, which defaults to the share of training invoices whose vendor appears once."""
         self.cfg = cfg
         layouts = graph.layouts()
         self.vendor_layouts = {i: L for i, L in layouts.items() if L["vendor"] != ALL_VENDORS}
@@ -40,7 +42,8 @@ class LayoutPosterior:
         self.theta_all = {page: L["n_filled"] / L["docs"] for page, L in self.corpus_layouts.items()}
         self.known_keys = {L["vendor"] for L in self.vendor_layouts.values()}
         train_count = corpus.train_count
-        self.p_new = sum(1 for n in train_count.values() if n == 1) / len(corpus.train_ids)   # Good-Turing N1/N
+        self.p_new = p_new if p_new is not None else \
+            sum(1 for n in train_count.values() if n == 1) / len(corpus.train_ids)            # Good-Turing N1/N
 
     def with_config(self, cfg: Config) -> "LayoutPosterior":
         """The same posterior with other settings (for sweeps); the graph is not read again."""

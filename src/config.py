@@ -24,6 +24,7 @@ class Config:
 
     # --- Consolidation -------------------------------------------------------------------------------------------
     structure_similarity: float = 0.85          # fill-vector cosine at or above which two pages share a layout variant
+    rule_group_similarity: float = 0.85         # structure-vector cosine at or above which a page is a rule group's candidate
     bbox_tolerance: float = 0.03                # box centres within this many page-widths/heights are "the same spot"
     min_support_fraction: float = 0.6           # share of located observations that must agree to make a rule
     min_support_docs: int = 2                   # ...and at least this many documents

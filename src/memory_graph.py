@@ -402,6 +402,17 @@ class MemoryGraph:
                    e.strength AS strength, e.bbox_range AS bbox_range, e.top_labels AS top_labels""",
                               all=ALL_VENDORS, defaulted=sorted(H.DEFAULTED_KEYS))
 
+    def similar_layout_pairs(self, min_similarity: float) -> list[dict]:
+        """PageLayouts of different vendors, same page number, whose structure vectors have cosine >= min."""
+        return self.cypher("""
+            MATCH (va:Vendor)-[:HAS_LAYOUT]->(a:PageLayout), (vb:Vendor)-[:HAS_LAYOUT]->(b:PageLayout)
+            WHERE va.key < vb.key AND va.key <> $all AND vb.key <> $all AND a.page_number = b.page_number
+            WITH va, vb, a, b, vector.similarity.cosine(a.structure_vector, b.structure_vector) AS sim
+            WHERE sim >= $min
+            RETURN va.key AS vendor_a, a.id AS layout_a, a.doc_count AS docs_a,
+                   vb.key AS vendor_b, b.id AS layout_b, b.doc_count AS docs_b, a.page_number AS page, sim
+            ORDER BY sim DESC""", all=ALL_VENDORS, min=min_similarity)
+
     def entity_observations(self, layout_id: str, key: str) -> dict:
         """The raw observations and consolidated rule of one EntityLayout."""
         return self.cypher("""MATCH (e:EntityLayout {id: $id})

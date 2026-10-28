@@ -130,14 +130,7 @@ def find_twins(graph: MemoryGraph, min_similarity: float, min_shared_rules: int 
     roughly where) have cosine >= min_similarity. Per pair: how many located rules they share, and on how many of
     those their ranges overlap (the twins "agree" on where the value is). Pairs sharing fewer than
     min_shared_rules located entities (e.g. near-empty continuation pages) are dropped."""
-    rows = graph.cypher("""
-        MATCH (va:Vendor)-[:HAS_LAYOUT]->(a:PageLayout), (vb:Vendor)-[:HAS_LAYOUT]->(b:PageLayout)
-        WHERE va.key < vb.key AND va.key <> $all AND vb.key <> $all AND a.page_number = b.page_number
-        WITH va, vb, a, b, vector.similarity.cosine(a.structure_vector, b.structure_vector) AS sim
-        WHERE sim >= $min
-        RETURN va.key AS vendor_a, a.id AS layout_a, a.doc_count AS docs_a,
-               vb.key AS vendor_b, b.id AS layout_b, b.doc_count AS docs_b, a.page_number AS page, sim
-        ORDER BY sim DESC""", all=ALL_VENDORS, min=min_similarity)
+    rows = graph.similar_layout_pairs(min_similarity)
     layouts = graph.layouts()
     for r in rows:
         agree = entity_agreement(layouts[r["layout_a"]], layouts[r["layout_b"]])
@@ -163,7 +156,8 @@ class ScenarioGenerator:
         self.corpus, self.graph, self.cfg = corpus, graph, cfg
         self.test_ids = sorted(corpus.test_ids)
         self.known_names = {v: n for v, n in ((r["vendor"], r["names"]) for r in graph.cypher(
-            "MATCH (v:Vendor) WHERE v.key <> $all RETURN v.key AS vendor, v.names AS names", all=ALL_VENDORS))}
+            "MATCH (v:Vendor) WHERE NOT v.key IN [$all, $unidentified] RETURN v.key AS vendor, v.names AS names",
+            all=ALL_VENDORS, unidentified=H.UNCLASSIFIED))}
 
     def _rng(self, *salt) -> random.Random:
         return random.Random(f"{self.cfg.scenario_seed}|" + "|".join(map(str, salt)))

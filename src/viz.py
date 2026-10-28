@@ -23,12 +23,16 @@ INK, INK_2, MUTED, GRID, AXIS, SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0
 
 LABEL_COLORS = {"DocumentType": INK_2, "Vendor": BLUE, "PageLayout": ORANGE, "SectionLayout": AQUA,
                 "EntityLayout": YELLOW, "TableLayout": MAGENTA, "ColumnLayout": GREEN,
-                "NormalizationRule": VIOLET, "Invariant": RED}
+                "NormalizationRule": VIOLET, "Invariant": RED,
+                # rule-group memory (src/rule_memory.py)
+                "RuleGroup": ORANGE, "EntityRule": YELLOW, "TableRule": MAGENTA, "Document": INK_2, "Page": MUTED,
+                "Field": AQUA, "Table": GREEN, "Entity": AXIS}
 GATE_COLORS = {"box": BLUE, "label": YELLOW, "withheld": MUTED, "no_position": GRID}
 STRENGTH_COLORS = {"strong": BLUE, "weak": AQUA, "single": YELLOW, "none": GRID}
 CAPTION_PROPERTY = {"DocumentType": "name", "Vendor": "key", "PageLayout": "id", "SectionLayout": "name",
                     "EntityLayout": "key", "TableLayout": "type", "ColumnLayout": "header",
-                    "NormalizationRule": "name", "Invariant": "name"}
+                    "NormalizationRule": "name", "Invariant": "name",
+                    "EntityRule": "key", "TableRule": "key", "Field": "key", "Table": "key", "Entity": "key"}
 
 plt.rcParams.update({
     "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "axes.edgecolor": AXIS, "axes.labelcolor": INK_2,
@@ -52,24 +56,32 @@ def default_caption(node: Node) -> str:
     value = node.properties.get(CAPTION_PROPERTY.get(label, ""), label)
     if label == "PageLayout":
         return f"page {node.properties['page_number']} v{node.properties['variant']}"
+    if label == "RuleGroup":
+        return f"{node.properties['id'].rsplit('|', 2)[-1]} · p{node.properties['page']} · {node.properties['n_pages']} pg"
+    if label == "Document":
+        return node.properties["doc_id"][:8]
+    if label == "Page":
+        return f"page {node.properties['number']}"
     return str(value)
 
 
 def show_graph(driver, query: str, *, caption: Callable[[Node], str] = default_caption,
                color: Callable[[Node], str] | None = None, size: Callable[[Node], float] | None = None,
                legend: dict[str, str] | None = None, layout: str = "forcedirected", height: str = "520px",
-               **params):
+               rel_caption: Callable | None = None, **params):
     """Run a Cypher query that returns nodes/relationships/paths and render the subgraph inline.
     `color`/`size`/`caption` map each node to its style; nodes are colored by label by default. `legend` is
-    {entry: color} for the graph's own legend overlay (by default, the labels present). Nodes stay at least
-    radius 24, below which neo4j-viz draws no caption."""
+    {entry: color} for the graph's own legend overlay (by default, the labels present). `rel_caption` maps each
+    relationship to its caption (by default its type, and none for `_` path edges). Nodes stay at least radius 24,
+    below which neo4j-viz draws no caption."""
     vg = from_neo4j(driver.execute_query(query, **params))
     for n in vg.nodes:
         n.caption = caption(n)
         n.color = color(n) if color else LABEL_COLORS.get(_label(n), MUTED)
-        n.size = size(n) if size else 34 if _label(n) in ("Vendor", "PageLayout") else 28
-    for r in vg.relationships:
-        r.caption = r.properties.get("type")
+        n.size = size(n) if size else 34 if _label(n) in ("Vendor", "PageLayout", "RuleGroup", "Document") else 28
+    for r in vg.relationships:          # `_` only chains a path together, so it is drawn as a plain arrow
+        r.caption = rel_caption(r) if rel_caption else "" if r.properties.get("type") == "_" else \
+            r.properties.get("type")
     vg.set_legend(nodes=legend or {lab: LABEL_COLORS[lab] for lab in LABEL_COLORS
                                    if any(_label(n) == lab for n in vg.nodes)})
     return vg.render(layout=layout, height=height)
